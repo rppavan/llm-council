@@ -1,166 +1,301 @@
-# CLAUDE.md - Technical Notes for LLM Council
+# CLAUDE.md
 
-This file contains technical details, architectural decisions, and important implementation notes for future development sessions.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively answer user questions. The key innovation is anonymized peer review in Stage 2, preventing models from playing favorites.
+LLM Council Plus is a 3-stage deliberation system where multiple LLMs collaboratively answer user questions through:
+1. **Stage 1**: Individual model responses (with optional web search context)
+2. **Stage 2**: Anonymous peer review/ranking to prevent bias
+3. **Stage 3**: Chairman synthesis of collective wisdom
 
-## Architecture
+**Key Innovation**: Hybrid architecture supporting OpenRouter (cloud), Ollama (local), Groq (fast inference), direct provider connections, and custom OpenAI-compatible endpoints.
 
-### Backend Structure (`backend/`)
+## Running the Application
 
-**`config.py`**
-- Contains `COUNCIL_MODELS` (list of OpenRouter model identifiers)
-- Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
-- Uses environment variable `OPENROUTER_API_KEY` from `.env`
-- Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
-
-**`openrouter.py`**
-- `query_model()`: Single async model query
-- `query_models_parallel()`: Parallel queries using `asyncio.gather()`
-- Returns dict with 'content' and optional 'reasoning_details'
-- Graceful degradation: returns None on failure, continues with successful responses
-
-**`council.py`** - The Core Logic
-- `stage1_collect_responses()`: Parallel queries to all council models
-- `stage2_collect_rankings()`:
-  - Anonymizes responses as "Response A, B, C, etc."
-  - Creates `label_to_model` mapping for de-anonymization
-  - Prompts models to evaluate and rank (with strict format requirements)
-  - Returns tuple: (rankings_list, label_to_model_dict)
-  - Each ranking includes both raw text and `parsed_ranking` list
-- `stage3_synthesize_final()`: Chairman synthesizes from all responses + rankings
-- `parse_ranking_from_text()`: Extracts "FINAL RANKING:" section, handles both numbered lists and plain format
-- `calculate_aggregate_rankings()`: Computes average rank position across all peer evaluations
-
-**`storage.py`**
-- JSON-based conversation storage in `data/conversations/`
-- Each conversation: `{id, created_at, messages[]}`
-- Assistant messages contain: `{role, stage1, stage2, stage3}`
-- Note: metadata (label_to_model, aggregate_rankings) is NOT persisted to storage, only returned via API
-
-**`main.py`**
-- FastAPI app with CORS enabled for localhost:5173 and localhost:3000
-- POST `/api/conversations/{id}/message` returns metadata in addition to stages
-- Metadata includes: label_to_model mapping and aggregate_rankings
-
-### Frontend Structure (`frontend/src/`)
-
-**`App.jsx`**
-- Main orchestration: manages conversations list and current conversation
-- Handles message sending and metadata storage
-- Important: metadata is stored in the UI state for display but not persisted to backend JSON
-
-**`components/ChatInterface.jsx`**
-- Multiline textarea (3 rows, resizable)
-- Enter to send, Shift+Enter for new line
-- User messages wrapped in markdown-content class for padding
-
-**`components/Stage1.jsx`**
-- Tab view of individual model responses
-- ReactMarkdown rendering with markdown-content wrapper
-
-**`components/Stage2.jsx`**
-- **Critical Feature**: Tab view showing RAW evaluation text from each model
-- De-anonymization happens CLIENT-SIDE for display (models receive anonymous labels)
-- Shows "Extracted Ranking" below each evaluation so users can validate parsing
-- Aggregate rankings shown with average position and vote count
-- Explanatory text clarifies that boldface model names are for readability only
-
-**`components/Stage3.jsx`**
-- Final synthesized answer from chairman
-- Green-tinted background (#f0fff0) to highlight conclusion
-
-**Styling (`*.css`)**
-- Light mode theme (not dark mode)
-- Primary color: #4a90e2 (blue)
-- Global markdown styling in `index.css` with `.markdown-content` class
-- 12px padding on all markdown content to prevent cluttered appearance
-
-## Key Design Decisions
-
-### Stage 2 Prompt Format
-The Stage 2 prompt is very specific to ensure parseable output:
-```
-1. Evaluate each response individually first
-2. Provide "FINAL RANKING:" header
-3. Numbered list format: "1. Response C", "2. Response A", etc.
-4. No additional text after ranking section
+**Quick Start:**
+```bash
+./start.sh
 ```
 
-This strict format allows reliable parsing while still getting thoughtful evaluations.
+**Manual Start:**
+```bash
+# Backend (from project root)
+uv run python -m backend.main
 
-### De-anonymization Strategy
-- Models receive: "Response A", "Response B", etc.
-- Backend creates mapping: `{"Response A": "openai/gpt-5.1", ...}`
-- Frontend displays model names in **bold** for readability
-- Users see explanation that original evaluation used anonymous labels
-- This prevents bias while maintaining transparency
+# Frontend (in new terminal)
+cd frontend
+npm run dev
+```
 
-### Error Handling Philosophy
-- Continue with successful responses if some models fail (graceful degradation)
-- Never fail the entire request due to single model failure
-- Log errors but don't expose to user unless all models fail
+**Ports:**
+- Backend: `http://localhost:8001` (NOT 8000 - avoid conflicts)
+- Frontend: `http://localhost:5173`
 
-### UI/UX Transparency
-- All raw outputs are inspectable via tabs
-- Parsed rankings shown below raw text for validation
-- Users can verify system's interpretation of model outputs
-- This builds trust and allows debugging of edge cases
+**Network Access:**
+```bash
+# Backend already listens on 0.0.0.0:8001
+# Frontend with network access:
+cd frontend && npm run dev -- --host
+```
 
-## Important Implementation Details
+**Installing Dependencies:**
+```bash
+# Backend
+uv sync
 
-### Relative Imports
-All backend modules use relative imports (e.g., `from .config import ...`) not absolute imports. This is critical for Python's module system to work correctly when running as `python -m backend.main`.
+# Frontend
+cd frontend
+npm install
+```
 
-### Port Configuration
-- Backend: 8001 (changed from 8000 to avoid conflict)
-- Frontend: 5173 (Vite default)
-- Update both `backend/main.py` and `frontend/src/api.js` if changing
+**Important**: If switching between Intel/Apple Silicon Macs with iCloud sync:
+```bash
+rm -rf frontend/node_modules && cd frontend && npm install
+```
+This fixes binary incompatibilities (e.g., `@rollup/rollup-darwin-*` variants).
 
-### Markdown Rendering
-All ReactMarkdown components must be wrapped in `<div className="markdown-content">` for proper spacing. This class is defined globally in `index.css`.
+## Architecture Overview
 
-### Model Configuration
-Models are hardcoded in `backend/config.py`. Chairman can be same or different from council members. The current default is Gemini as chairman per user preference.
+### Backend (`backend/`)
+
+**Provider System** (`backend/providers/`)
+- **Base**: `base.py` - Abstract interface for all LLM providers
+- **Implementations**: `openrouter.py`, `ollama.py`, `groq.py`, `openai.py`, `anthropic.py`, `google.py`, `mistral.py`, `deepseek.py`, `custom_openai.py`
+- **Auto-routing**: Model IDs with prefix (e.g., `openai:gpt-4.1`, `ollama:llama3`, `custom:model-name`) route to correct provider
+- **Routing logic**: `council.py:get_provider_for_model()` handles prefix parsing
+
+**Core Modules**
+
+| Module | Purpose |
+|--------|---------|
+| `council.py` | Orchestration: stage1/2/3 collection, rankings, title generation |
+| `search.py` | Web search: DuckDuckGo, Tavily, Brave with Jina Reader content fetch |
+| `settings.py` | Config management, persisted to `data/settings.json` |
+| `prompts.py` | Default system prompts for all stages |
+| `main.py` | FastAPI app with streaming SSE endpoint |
+| `storage.py` | Conversation persistence in `data/conversations/{id}.json` |
+
+### Frontend (`frontend/src/`)
+
+| Component | Purpose |
+|-----------|---------|
+| `App.jsx` | Main orchestration, SSE streaming, conversation state |
+| `ChatInterface.jsx` | User input, web search toggle, execution mode |
+| `Stage1.jsx` | Tab view of individual model responses |
+| `Stage2.jsx` | Peer rankings with de-anonymization, aggregate scores |
+| `Stage3.jsx` | Chairman synthesis (final answer) |
+| `CouncilGrid.jsx` | Visual grid of council members with provider icons |
+| `Settings.jsx` | 5-section settings: LLM API Keys, Council Config, System Prompts, Search Providers, Backup & Reset |
+| `Sidebar.jsx` | Conversation list with inline delete confirmation |
+| `SearchableModelSelect.jsx` | Searchable dropdown for model selection |
+
+**Styling**: "Council Chamber" dark theme (refined Midnight Glass). CSS variables in `index.css` (`--font-display`: Syne, `--font-ui`: Plus Jakarta Sans, `--font-content`: Source Serif 4, `--font-code`: JetBrains Mono). Primary accent blue (#3b82f6), chairman gold (#fbbf24). Staggered hero/card animations; glass panels with backdrop-filter.
+
+## Critical Implementation Details
+
+### Python Module Imports
+**ALWAYS** use relative imports in backend modules:
+```python
+from .config import ...
+from .council import ...
+```
+**NEVER** use absolute imports like `from backend.config import ...`
+
+**Run backend as module** from project root:
+```bash
+uv run python -m backend.main  # Correct
+cd backend && python main.py  # WRONG - breaks imports
+```
+
+### Model ID Prefix Format
+```
+openrouter:anthropic/claude-sonnet-4  → Cloud via OpenRouter
+ollama:llama3.1:latest                → Local via Ollama
+groq:llama3-70b-8192                  → Fast inference via Groq
+openai:gpt-4.1                        → Direct OpenAI connection
+anthropic:claude-sonnet-4             → Direct Anthropic connection
+custom:model-name                     → Custom OpenAI-compatible endpoint
+```
+
+### Model Name Display Helper
+Use this pattern in Stage components to handle both `/` and `:` delimiters:
+```jsx
+const getShortModelName = (modelId) => {
+  if (!modelId) return 'Unknown';
+  if (modelId.includes('/')) return modelId.split('/').pop();
+  if (modelId.includes(':')) return modelId.split(':').pop();
+  return modelId;
+};
+```
+
+### Provider Icon Detection (CouncilGrid.jsx)
+Check prefixes FIRST before name-based detection to avoid mismatches:
+```jsx
+const getProviderInfo = (modelId) => {
+    const id = modelId.toLowerCase();
+    // Check prefixes FIRST (order matters!)
+    if (id.startsWith('custom:')) return PROVIDER_CONFIG.custom;
+    if (id.startsWith('ollama:')) return PROVIDER_CONFIG.ollama;
+    if (id.startsWith('groq:')) return PROVIDER_CONFIG.groq;
+    // Then check name-based patterns...
+};
+```
+
+### Stage 2 Ranking Format
+The prompt enforces strict format for parsing:
+```
+1. Individual evaluations
+2. Blank line
+3. "FINAL RANKING:" header (all caps, with colon)
+4. Numbered list: "1. Response C", "2. Response A", etc.
+```
+Fallback regex extracts "Response X" patterns if format not followed.
+
+### Streaming & Abort Logic
+- Backend checks `request.is_disconnected()` inside loops
+- Frontend aborts via AbortController signal
+- **Critical**: Always inject raw `Request` object into streaming endpoints (Pydantic models lack `is_disconnected()`)
+
+### ReactMarkdown Safety
+```jsx
+<div className="markdown-content">
+  <ReactMarkdown>
+    {typeof content === 'string' ? content : String(content || '')}
+  </ReactMarkdown>
+</div>
+```
+Always wrap in `.markdown-content` div and ensure string type (some providers return arrays/objects).
+
+### Tab Bounds Safety
+In Stage1/Stage2, auto-adjust activeTab when out of bounds during streaming:
+```jsx
+useEffect(() => {
+  if (activeTab >= responses.length && responses.length > 0) {
+    setActiveTab(responses.length - 1);
+  }
+}, [responses.length]);
+```
 
 ## Common Gotchas
 
-1. **Module Import Errors**: Always run backend as `python -m backend.main` from project root, not from backend directory
-2. **CORS Issues**: Frontend must match allowed origins in `main.py` CORS middleware
-3. **Ranking Parse Failures**: If models don't follow format, fallback regex extracts any "Response X" patterns in order
-4. **Missing Metadata**: Metadata is ephemeral (not persisted), only available in API responses
+1. **Port Conflicts**: Backend uses 8001 (not 8000). Update `backend/main.py` and `frontend/src/api.js` together.
 
-## Future Enhancement Ideas
+2. **CORS Errors**: Frontend origins must match `main.py` CORS middleware (localhost:5173 and :3000).
 
-- Configurable council/chairman via UI instead of config file
-- Streaming responses instead of batch loading
-- Export conversations to markdown/PDF
+3. **Missing Metadata**: `label_to_model` and `aggregate_rankings` are ephemeral - only in API responses, not stored.
+
+4. **Duplicate Tabs**: Use immutable state updates (spread operator), not mutations. StrictMode runs effects twice.
+
+5. **Search Rate Limits**: DuckDuckGo can rate-limit. Retry logic in `search.py` handles this.
+
+6. **Jina Reader 451 Errors**: Many news sites block AI scrapers. Use Tavily/Brave or set `full_content_results` to 0.
+
+7. **Model Deduplication**: When multiple sources provide same model, use Map-based deduplication preferring direct connections.
+
+8. **Binary Dependencies**: `node_modules` in iCloud can break between Mac architectures. Delete and reinstall.
+
+9. **Custom Endpoint Icons**: Models from custom endpoints may match name patterns (e.g., "claude"). Check `custom:` prefix first.
+
+## Data Flow
+
+```
+User Query (+ optional web search)
+    ↓
+[Web Search: DuckDuckGo/Tavily/Brave + Jina Reader]
+    ↓
+Stage 1: Parallel queries → Stream individual responses
+    ↓
+Stage 2: Anonymize → Parallel peer rankings → Parse rankings
+    ↓
+Calculate aggregate rankings
+    ↓
+Stage 3: Chairman synthesis → Stream final answer
+    ↓
+Save conversation (stage1, stage2, stage3 only)
+```
+
+## Execution Modes
+
+Three modes control deliberation depth:
+- **Chat Only**: Stage 1 only (quick responses)
+- **Chat + Ranking**: Stages 1 & 2 (peer review without synthesis)
+- **Full Deliberation**: All 3 stages (default)
+
+## Testing & Debugging
+
+```bash
+# Check Ollama models
+curl http://localhost:11434/api/tags
+
+# Test custom endpoint
+curl https://your-endpoint.com/v1/models -H "Authorization: Bearer $API_KEY"
+
+# View logs
+# Watch terminal running backend/main.py
+```
+
+## Web Search
+
+**Providers**: DuckDuckGo (free), Tavily (API), Brave (API)
+
+**Full Content Fetching**: Jina Reader (`https://r.jina.ai/{url}`) extracts article text for top N results (configurable 0-10, default 3). Falls back to summary if fetch fails or yields <500 chars. 25-second timeout per article, 60-second total search budget.
+
+**Search Query Processing**:
+- **Direct** (default): Send exact query to search engine
+- **YAKE**: Extract keywords first (useful for long prompts)
+
+## Settings
+
+**UI Sections** (sidebar navigation):
+1. **LLM API Keys**: OpenRouter, Groq, Ollama, Direct providers, Custom endpoint
+2. **Council Config**: Model selection with Remote/Local toggles, temperature controls, "I'm Feeling Lucky" randomizer
+3. **System Prompts**: Stage 1/2/3 prompts with reset-to-default
+4. **Search Providers**: DuckDuckGo, Tavily, Brave + Jina full content settings
+5. **Backup & Reset**: Import/Export config, reset to defaults
+
+**Auto-Save Behavior**:
+- **Credentials auto-save**: API keys and URLs save immediately on successful test
+- **Configs require manual save**: Model selections, prompts, temperatures
+- UX flow: Test → Success → Auto-save → Clear input → "Settings saved!"
+
+**Temperature Controls**:
+- Council Heat: Stage 1 creativity (default: 0.5)
+- Chairman Heat: Stage 3 synthesis (default: 0.4)
+- Stage 2 Heat: Peer ranking consistency (default: 0.3)
+
+**Rate Limit Warnings**:
+- Formula: `(council_members × 2) + 2` requests per council run
+- OpenRouter free tier: 20 RPM, 50 requests/day
+- Groq: 30 RPM, 14,400 requests/day
+
+**Storage**: `data/settings.json`
+
+## Design Principles
+
+- **Graceful Degradation**: Single model failure doesn't block entire council
+- **Transparency**: All raw outputs inspectable via tabs
+- **De-anonymization**: Models receive "Response A/B/C", frontend displays real names
+- **Progress Indicators**: "X/Y completed" during streaming
+- **Provider Flexibility**: Mix cloud, local, and custom endpoints freely
+
+## Code Safety Guidelines
+
+**Communication:**
+- NEVER make assumptions when requirements are vague - ask for clarification
+- Provide options with pros/cons for different approaches
+- Confirm understanding before significant changes
+
+**Code Safety:**
+- NEVER use placeholders like `// ...` in edits - this deletes code
+- Always provide full content when writing/editing files
+- FastAPI: Inject raw `Request` object to access `is_disconnected()`
+- React: Use spread operators for immutable state updates (StrictMode runs effects twice)
+
+## Future Enhancements
+
 - Model performance analytics over time
-- Custom ranking criteria (not just accuracy/insight)
-- Support for reasoning models (o1, etc.) with special handling
-
-## Testing Notes
-
-Use `test_openrouter.py` to verify API connectivity and test different model identifiers before adding to council. The script tests both streaming and non-streaming modes.
-
-## Data Flow Summary
-
-```
-User Query
-    ↓
-Stage 1: Parallel queries → [individual responses]
-    ↓
-Stage 2: Anonymize → Parallel ranking queries → [evaluations + parsed rankings]
-    ↓
-Aggregate Rankings Calculation → [sorted by avg position]
-    ↓
-Stage 3: Chairman synthesis with full context
-    ↓
-Return: {stage1, stage2, stage3, metadata}
-    ↓
-Frontend: Display with tabs + validation UI
-```
-
-The entire flow is async/parallel where possible to minimize latency.
+- Export conversations to markdown/PDF
+- Custom ranking criteria (beyond accuracy/insight)
+- Backend caching for repeated queries
+- Multiple custom endpoints support
